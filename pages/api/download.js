@@ -10,29 +10,48 @@ export default async function handler(req, res) {
   if (!storyLink) return res.status(400).json({ error: 'No story link provided' });
 
   try {
-    // Step 1: Get fresh page to extract wire:id and checksum
+    // Step 1: Visit BraveDown and get cookies
     const pageResp = await axios.get(BRAVEDOWN_PAGE, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36'
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml'
       },
-      timeout: 15000
+      timeout: 15000,
+      withCredentials: true
     });
 
-    const html = pageResp.data;
+    // Extract all cookies from response
+    const setCookies = pageResp.headers['set-cookie'] || [];
+    const cookieString = setCookies.map(c => c.split(';')[0]).join('; ');
 
-    // Extract wire:id
-    const wireIdMatch = html.match(/wire:id="([^"]+)"/i);
-    const wireId = wireIdMatch ? wireIdMatch[1] : 'hqYYZYzNd8aJbH1i63zm';
+    // Extract XSRF-TOKEN from cookies
+    let xsrfCookie = '';
+    setCookies.forEach(c => {
+      const match = c.match(/XSRF-TOKEN=([^;]+)/);
+      if (match) xsrfCookie = decodeURIComponent(match[1]);
+    });
 
-    // Extract checksum
-    const checksumMatch = html.match(/checksum['"]?\s*:\s*['"]([a-f0-9]{64})['"]/i);
-    const checksum = checksumMatch ? checksumMatch[1] : '883fdd8d5843e362283eec7de1c6bde85835be43b8a4c11603170eb97752a085';
+    // Extract wire:id from HTML
+    const wireIdMatch = pageResp.data.match(/wire:id="([^"]+)"/i);
+    const wireId = wireIdMatch ? wireIdMatch[1] : '';
 
-    // Extract CSRF token
-    const tokenMatch = html.match(/csrf_token['"]?\s*:\s*['"]([^'"]+)['"]/i);
-    const csrfToken = tokenMatch ? tokenMatch[1] : 'LApQk7xDk6eK5sy4CghCSU84TUw5hM1TuZ7fOk5k';
+    // Extract checksum from HTML
+    const checksumMatch = pageResp.data.match(/checksum['"]?\s*:\s*['"]([a-f0-9]{64})['"]/i);
+    const checksum = checksumMatch ? checksumMatch[1] : '';
 
-    // Step 2: Build the EXACT payload matching the working request
+    // Extract _token (CSRF) from the page's Livewire data
+    const tokenMatch = pageResp.data.match(/csrf_token['"]?\s*:\s*['"]([^'"]+)['"]/i)
+      || pageResp.data.match(/"token":"([^"]+)"/i);
+    const csrfToken = tokenMatch ? tokenMatch[1] : '';
+
+    if (!wireId || !csrfToken || !cookieString) {
+      return res.status(500).json({ 
+        error: 'Failed to initialize BraveDown session',
+        debug: { wireId: !!wireId, token: !!csrfToken, cookies: !!cookieString }
+      });
+    }
+
+    // Step 2: Build snapshot with extracted values
     const snapshot = JSON.stringify({
       data: {
         zlinkz: null,
@@ -73,11 +92,16 @@ export default async function handler(req, res) {
       }]
     };
 
-    // Step 3: Send with EXACT headers from working request
+    // Step 3: Send request WITH COOKIES
     const downloadResp = await axios.post(BRAVEDOWN_LIVEWIRE, payload, {
       headers: {
-        'Content-type': 'application/json',
-        'X-Livewire': ''
+        'Content-type': 'application/json;charset=UTF-8',
+        'X-Livewire': '',
+        'X-XSRF-TOKEN': xsrfCookie,
+        'Cookie': cookieString,
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36',
+        'Referer': BRAVEDOWN_PAGE,
+        'Origin': 'https://bravedown.com'
       },
       timeout: 25000
     });
@@ -98,7 +122,7 @@ export default async function handler(req, res) {
 
     if (!downloadUrl) {
       return res.status(400).json({ 
-        error: 'BraveDown did not return a download URL. Story may be private or expired.' 
+        error: 'BraveDown did not return a download URL. Story may be private or expired.'
       });
     }
 
@@ -110,7 +134,7 @@ export default async function handler(req, res) {
     });
 
     const contentType = mediaResp.headers['content-type'] || 'image/jpeg';
-    const isVideo = contentType.startsWith('video') || downloadUrl.includes('mp4');
+    const isVideo = contentType.startsWith('video');
     const ext = isVideo ? 'mp4' : 'jpg';
 
     // Step 6: Upload to Supabase
@@ -143,8 +167,7 @@ export default async function handler(req, res) {
     console.error('Error:', err.message);
     return res.status(500).json({ 
       error: 'Download failed', 
-      message: err.response?.status || err.message,
-      details: err.response?.data ? JSON.stringify(err.response.data).slice(0, 300) : null
+      message: err.response?.status || err.message
     });
   }
 }
