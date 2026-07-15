@@ -1,7 +1,6 @@
 import axios from 'axios';
 import { createClient } from '@supabase/supabase-js';
 
-// BraveDown's real Livewire endpoint
 const BRAVEDOWN_LIVEWIRE = 'https://bravedown.com/livewire/update';
 const BRAVEDOWN_PAGE = 'https://bravedown.com/facebook-story-downloader';
 
@@ -11,36 +10,29 @@ export default async function handler(req, res) {
   if (!storyLink) return res.status(400).json({ error: 'No story link provided' });
 
   try {
-    // Step 1: Get fresh session from BraveDown
-    const sessionResp = await axios.get(BRAVEDOWN_PAGE, {
+    // Step 1: Get fresh page to extract wire:id and checksum
+    const pageResp = await axios.get(BRAVEDOWN_PAGE, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36'
       },
-      timeout: 15000,
-      maxRedirects: 5
+      timeout: 15000
     });
 
-    // Extract cookies
-    const cookies = sessionResp.headers['set-cookie'] || [];
-    const cookieJar = cookies.map(c => c.split(';')[0]).join('; ');
+    const html = pageResp.data;
 
-    // Extract CSRF token from Livewire script in the page
-    const tokenMatch = sessionResp.data.match(/csrf_token['"]?\s*:\s*['"]([^'"]+)['"]/i)
-      || sessionResp.data.match(/XSRF-TOKEN[^=]+=([^;]+)/i)
-      || sessionResp.data.match(/"token":"([^"]+)"/i);
-    
-    const csrfToken = tokenMatch ? tokenMatch[1] : '';
+    // Extract wire:id
+    const wireIdMatch = html.match(/wire:id="([^"]+)"/i);
+    const wireId = wireIdMatch ? wireIdMatch[1] : 'hqYYZYzNd8aJbH1i63zm';
 
-    // Extract Livewire component ID
-    const wireIdMatch = sessionResp.data.match(/wire:id="([^"]+)"/i);
-    const wireId = wireIdMatch ? wireIdMatch[1] : 'U8Wf14EhyEnNA0eva8eF';
+    // Extract checksum
+    const checksumMatch = html.match(/checksum['"]?\s*:\s*['"]([a-f0-9]{64})['"]/i);
+    const checksum = checksumMatch ? checksumMatch[1] : '883fdd8d5843e362283eec7de1c6bde85835be43b8a4c11603170eb97752a085';
 
-    if (!csrfToken) {
-      return res.status(500).json({ error: 'Failed to get CSRF token from BraveDown' });
-    }
+    // Extract CSRF token
+    const tokenMatch = html.match(/csrf_token['"]?\s*:\s*['"]([^'"]+)['"]/i);
+    const csrfToken = tokenMatch ? tokenMatch[1] : 'LApQk7xDk6eK5sy4CghCSU84TUw5hM1TuZ7fOk5k';
 
-    // Step 2: Build the exact payload that works
+    // Step 2: Build the EXACT payload matching the working request
     const snapshot = JSON.stringify({
       data: {
         zlinkz: null,
@@ -63,7 +55,7 @@ export default async function handler(req, res) {
         errors: [],
         locale: 'en'
       },
-      checksum: '52e57ef209d2075abcb8a18e9a984fac4757978ea97010a346dcdaf5818e95d5'
+      checksum: checksum
     });
 
     const payload = {
@@ -81,23 +73,16 @@ export default async function handler(req, res) {
       }]
     };
 
-    // Step 3: Send the download request
+    // Step 3: Send with EXACT headers from working request
     const downloadResp = await axios.post(BRAVEDOWN_LIVEWIRE, payload, {
       headers: {
-        'Content-Type': 'application/json;charset=UTF-8',
-        'Accept': 'application/json, text/plain, */*',
-        'X-Requested-With': 'XMLHttpRequest',
-        'X-Livewire': 'true',
-        'X-CSRF-TOKEN': csrfToken,
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36',
-        'Referer': BRAVEDOWN_PAGE,
-        'Origin': 'https://bravedown.com',
-        'Cookie': cookieJar
+        'Content-type': 'application/json',
+        'X-Livewire': ''
       },
       timeout: 25000
     });
 
-    // Step 4: Parse the response to get download URL
+    // Step 4: Parse response
     const respData = downloadResp.data;
     let downloadUrl = null;
 
@@ -112,10 +97,12 @@ export default async function handler(req, res) {
     }
 
     if (!downloadUrl) {
-      return res.status(400).json({ error: 'BraveDown did not return a download URL. Story may be private or expired.' });
+      return res.status(400).json({ 
+        error: 'BraveDown did not return a download URL. Story may be private or expired.' 
+      });
     }
 
-    // Step 5: Download the media file from BraveDown's CDN
+    // Step 5: Download media from BraveDown's CDN
     const mediaResp = await axios.get(downloadUrl, {
       responseType: 'arraybuffer',
       timeout: 30000,
@@ -157,7 +144,7 @@ export default async function handler(req, res) {
     return res.status(500).json({ 
       error: 'Download failed', 
       message: err.response?.status || err.message,
-      details: err.response?.data ? JSON.stringify(err.response.data).slice(0, 200) : null
+      details: err.response?.data ? JSON.stringify(err.response.data).slice(0, 300) : null
     });
   }
 }
