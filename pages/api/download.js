@@ -1,8 +1,9 @@
 import axios from 'axios';
 import { createClient } from '@supabase/supabase-js';
 
+// BraveDown's real Livewire endpoint
+const BRAVEDOWN_LIVEWIRE = 'https://bravedown.com/livewire/update';
 const BRAVEDOWN_PAGE = 'https://bravedown.com/facebook-story-downloader';
-const BRAVEDOWN_API = 'https://bravedown.com/livewire/update';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
@@ -10,57 +11,37 @@ export default async function handler(req, res) {
   if (!storyLink) return res.status(400).json({ error: 'No story link provided' });
 
   try {
-    // Step 1: Visit BraveDown and get fresh cookies + CSRF token
-    const pageResp = await axios.get(BRAVEDOWN_PAGE, {
+    // Step 1: Get fresh session from BraveDown
+    const sessionResp = await axios.get(BRAVEDOWN_PAGE, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
       },
       timeout: 15000,
-      withCredentials: true
+      maxRedirects: 5
     });
 
-    // Extract all cookies from Set-Cookie headers
-    const setCookieHeaders = pageResp.headers['set-cookie'] || [];
-    let sessionCookie = '';
-    let xsrfToken = '';
+    // Extract cookies
+    const cookies = sessionResp.headers['set-cookie'] || [];
+    const cookieJar = cookies.map(c => c.split(';')[0]).join('; ');
 
-    setCookieHeaders.forEach(cookie => {
-      const parts = cookie.split(';')[0];
-      if (parts.includes('bravedown_session') || parts.includes('laravel_session')) {
-        sessionCookie += (sessionCookie ? '; ' : '') + parts;
-      }
-      if (parts.includes('XSRF-TOKEN')) {
-        xsrfToken = decodeURIComponent(parts.split('=')[1]);
-      }
-    });
+    // Extract CSRF token from Livewire script in the page
+    const tokenMatch = sessionResp.data.match(/csrf_token['"]?\s*:\s*['"]([^'"]+)['"]/i)
+      || sessionResp.data.match(/XSRF-TOKEN[^=]+=([^;]+)/i)
+      || sessionResp.data.match(/"token":"([^"]+)"/i);
+    
+    const csrfToken = tokenMatch ? tokenMatch[1] : '';
 
-    // Step 2: Find the Livewire component ID in the page
-    const wireIdMatch = pageResp.data.match(/wire:id="([^"]+)"/i) || 
-                        pageResp.data.match(/wire:id=([^\s>]+)/i);
-    const wireId = wireIdMatch ? wireIdMatch[1].replace(/"/g, '') : '';
+    // Extract Livewire component ID
+    const wireIdMatch = sessionResp.data.match(/wire:id="([^"]+)"/i);
+    const wireId = wireIdMatch ? wireIdMatch[1] : 'U8Wf14EhyEnNA0eva8eF';
 
-    // Step 3: If no XSRF token in cookie, try to find it in the page HTML
-    if (!xsrfToken) {
-      const tokenMatch = pageResp.data.match(/<meta[^>]+name="csrf-token"[^>]+content="([^"]+)"/i);
-      if (tokenMatch) xsrfToken = tokenMatch[1];
+    if (!csrfToken) {
+      return res.status(500).json({ error: 'Failed to get CSRF token from BraveDown' });
     }
 
-    // Step 4: Also try to get token from Livewire's own meta
-    if (!xsrfToken) {
-      const lwToken = pageResp.data.match(/csrf_token['"]\s*:\s*['"]([^'"]+)['"]/i);
-      if (lwToken) xsrfToken = lwToken[1];
-    }
-
-    if (!xsrfToken || !wireId) {
-      return res.status(500).json({ 
-        error: 'Could not initialize session with BraveDown',
-        debug: { token: !!xsrfToken, wireId: !!wireId }
-      });
-    }
-
-    // Step 5: Build the exact payload
-    const snapshot = {
+    // Step 2: Build the exact payload that works
+    const snapshot = JSON.stringify({
       data: {
         zlinkz: null,
         render_mode: false,
@@ -83,12 +64,12 @@ export default async function handler(req, res) {
         locale: 'en'
       },
       checksum: '52e57ef209d2075abcb8a18e9a984fac4757978ea97010a346dcdaf5818e95d5'
-    };
+    });
 
     const payload = {
-      _token: xsrfToken,
+      _token: csrfToken,
       components: [{
-        snapshot: JSON.stringify(snapshot),
+        snapshot: snapshot,
         updates: {
           zlinkz: storyLink
         },
@@ -100,39 +81,33 @@ export default async function handler(req, res) {
       }]
     };
 
-    // Step 6: Call BraveDown's API
-    const bravedownResp = await axios.post(BRAVEDOWN_API, payload, {
+    // Step 3: Send the download request
+    const downloadResp = await axios.post(BRAVEDOWN_LIVEWIRE, payload, {
       headers: {
         'Content-Type': 'application/json;charset=UTF-8',
         'Accept': 'application/json, text/plain, */*',
         'X-Requested-With': 'XMLHttpRequest',
         'X-Livewire': 'true',
-        'X-CSRF-TOKEN': xsrfToken,
+        'X-CSRF-TOKEN': csrfToken,
         'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36',
-        'Referer': BRAVEDOWN_PAGE + '/',
+        'Referer': BRAVEDOWN_PAGE,
         'Origin': 'https://bravedown.com',
-        'Cookie': sessionCookie
+        'Cookie': cookieJar
       },
       timeout: 25000
     });
 
-    // Step 7: Extract download URL
-    const respData = bravedownResp.data;
+    // Step 4: Parse the response to get download URL
+    const respData = downloadResp.data;
     let downloadUrl = null;
 
-    if (respData.components && respData.components[0]) {
-      try {
-        const snapData = JSON.parse(respData.components[0].snapshot);
-        if (snapData.data && snapData.data.data && snapData.data.data[0]) {
-          const links = snapData.data.data[0].links;
-          if (links && links[0] && links[0][0] && links[0][0][0]) {
-            downloadUrl = links[0][0][0][0].url;
-          }
+    if (respData.components && respData.components[0] && respData.components[0].snapshot) {
+      const snapData = JSON.parse(respData.components[0].snapshot);
+      if (snapData.data && snapData.data.data && Array.isArray(snapData.data.data) && snapData.data.data[0]) {
+        const links = snapData.data.data[0].links;
+        if (links && links[0] && links[0][0] && links[0][0][0]) {
+          downloadUrl = links[0][0][0][0].url;
         }
-      } catch (e) {
-        // Regex fallback
-        const match = JSON.stringify(respData).match(/https?:\\\/\\\/acdn\.bravedown\.com\\\/download\?token=[^"\\\s]+/);
-        if (match) downloadUrl = match[0].replace(/\\\//g, '/');
       }
     }
 
@@ -140,7 +115,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'BraveDown did not return a download URL. Story may be private or expired.' });
     }
 
-    // Step 8: Download from BraveDown's CDN
+    // Step 5: Download the media file from BraveDown's CDN
     const mediaResp = await axios.get(downloadUrl, {
       responseType: 'arraybuffer',
       timeout: 30000,
@@ -148,10 +123,10 @@ export default async function handler(req, res) {
     });
 
     const contentType = mediaResp.headers['content-type'] || 'image/jpeg';
-    const isVideo = contentType.startsWith('video');
+    const isVideo = contentType.startsWith('video') || downloadUrl.includes('mp4');
     const ext = isVideo ? 'mp4' : 'jpg';
 
-    // Step 9: Upload to Supabase
+    // Step 6: Upload to Supabase
     const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
     const fileName = `stories/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
     
@@ -160,7 +135,7 @@ export default async function handler(req, res) {
       .upload(fileName, mediaResp.data, { contentType, upsert: true });
     
     if (uploadError) {
-      return res.status(500).json({ error: 'Upload failed', details: uploadError.message });
+      return res.status(500).json({ error: 'Supabase upload failed', details: uploadError.message });
     }
 
     const { data: publicUrlData } = supabase.storage.from('story-media').getPublicUrl(fileName);
@@ -181,7 +156,8 @@ export default async function handler(req, res) {
     console.error('Error:', err.message);
     return res.status(500).json({ 
       error: 'Download failed', 
-      message: err.response?.status || err.message 
+      message: err.response?.status || err.message,
+      details: err.response?.data ? JSON.stringify(err.response.data).slice(0, 200) : null
     });
   }
 }
