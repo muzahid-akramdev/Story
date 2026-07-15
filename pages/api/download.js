@@ -26,21 +26,31 @@ export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
   const { storyLink } = req.body;
   if (!storyLink) return res.status(400).json({ error: 'No story link provided' });
+
   try {
+    // Check if Supabase env vars exist
+    if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(500).json({ error: 'Missing Supabase environment variables. Please set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Vercel.' });
+    }
+
     const formData = new URLSearchParams();
     formData.append('url', storyLink);
     const resp = await axios.post(DOWNLOADER_URL, formData, {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       timeout: 20000
     });
+
     const mediaUrl = extractMediaUrl(resp.data);
-    if (!mediaUrl) return res.status(400).json({ error: 'Could not extract media URL.' });
+    if (!mediaUrl) {
+      return res.status(400).json({ error: 'Could not extract media URL. The downloader service might have changed.', htmlSnippet: resp.data.slice(0, 500) });
+    }
 
     const mediaResp = await axios.get(mediaUrl, {
       responseType: 'arraybuffer',
       timeout: 30000,
       headers: { 'User-Agent': 'Mozilla/5.0' }
     });
+
     const contentType = mediaResp.headers['content-type'] || 'image/jpeg';
     const isVideo = contentType.startsWith('video');
     const ext = isVideo ? 'mp4' : 'jpg';
@@ -50,17 +60,25 @@ export default async function handler(req, res) {
     const { error: uploadError } = await supabase.storage
       .from('story-media')
       .upload(fileName, mediaResp.data, { contentType, upsert: true });
-    if (uploadError) throw uploadError;
-    const { data: publicUrlData } = supabase.storage.from('story-media').getPublicUrl(fileName);
+    if (uploadError) {
+      return res.status(500).json({ error: 'Supabase upload failed', details: uploadError.message });
+    }
 
+    const { data: publicUrlData } = supabase.storage.from('story-media').getPublicUrl(fileName);
     await supabase.from('stories').insert({
       original_link: storyLink,
       media_url: publicUrlData.publicUrl,
       media_type: isVideo ? 'video' : 'image'
     });
+
     return res.status(200).json({ success: true, mediaUrl: publicUrlData.publicUrl, type: isVideo ? 'video' : 'image' });
+
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'Internal server error' });
+    console.error('Download error:', err);
+    return res.status(500).json({
+      error: 'Internal server error',
+      message: err.message,
+      stack: err.stack?.split('\n').slice(0, 3).join('\n'),
+    });
   }
 }
