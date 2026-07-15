@@ -1,6 +1,8 @@
 import axios from 'axios';
-import * as cheerio from 'cheerio';
 import { createClient } from '@supabase/supabase-js';
+
+// BraveDown's real API
+const BRAVEDOWN_API = 'https://bravedown.com/livewire/update';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
@@ -8,135 +10,118 @@ export default async function handler(req, res) {
   if (!storyLink) return res.status(400).json({ error: 'No story link provided' });
 
   try {
-    // Fetch the story page (anonymous)
-    const pageResp = await axios.get(storyLink, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml',
-        'Accept-Language': 'en-US,en;q=0.9'
-      },
-      timeout: 15000
+    // First, get a fresh CSRF token by visiting the page
+    const pageResp = await axios.get('https://bravedown.com/facebook-story-downloader', {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36' },
+      timeout: 10000
     });
 
-    const html = pageResp.data;
-    let mediaUrl = null;
-    let isVideo = false;
+    // Extract CSRF token from cookies
+    const cookies = pageResp.headers['set-cookie'] || [];
+    const xsrfToken = cookies.find(c => c.includes('XSRF-TOKEN'))?.split(';')[0]?.split('=')[1] || '';
+    const sessionCookie = cookies.find(c => c.includes('laravel_session') || c.includes('bravedown_session'))?.split(';')[0] || '';
 
-    // Method 1: Look for story video in Facebook's video tag
-    const videoMatch = html.match(/<video[^>]*>[\s\S]*?<source\s+src="([^"]+\.mp4[^"]*)"/i);
-    if (videoMatch) {
-      mediaUrl = videoMatch[1].replace(/&amp;/g, '&');
-      isVideo = true;
+    // Parse CSRF token from page if not in cookies
+    let token = xsrfToken || '';
+    if (!token) {
+      const tokenMatch = pageResp.data.match(/<meta name="csrf-token" content="([^"]+)"/);
+      if (tokenMatch) token = tokenMatch[1];
     }
 
-    // Method 2: Look for story image in Facebook's story image tag
-    if (!mediaUrl) {
-      const imgMatch = html.match(/<img[^>]*class="[^"]*story[^"]*"[^>]*src="([^"]+)"/i)
-        || html.match(/<img[^>]*src="([^"]*story[^"]*\.(jpg|jpeg|png|webp)[^"]*)"/i)
-        || html.match(/<img[^>]*src="([^"]*stories[^"]*\.(jpg|jpeg|png|webp)[^"]*)"/i);
-      if (imgMatch) {
-        mediaUrl = imgMatch[1].replace(/&amp;/g, '&');
-      }
-    }
+    // Get the Livewire component ID from the page
+    const wireIdMatch = pageResp.data.match(/wire:id="([^"]+)"/);
+    const wireId = wireIdMatch ? wireIdMatch[1] : 'wex64yrPcL5n6jal6VSt';
 
-    // Method 3: Look for Facebook's story media in JSON data
-    if (!mediaUrl) {
-      const jsonMatch = html.match(/"story_bucket_owner"[^}]+"story_media_url":"([^"]+)"/i)
-        || html.match(/"media_url":"([^"]+)"/i)
-        || html.match(/"url":"(https:\\\/\\\/[^"]*fbcdn[^"]*\.(mp4|jpg|jpeg|png|webp)[^"]*)"/i);
-      if (jsonMatch) {
-        mediaUrl = jsonMatch[1].replace(/\\\//g, '/').replace(/&amp;/g, '&');
-        if (mediaUrl.endsWith('.mp4')) isVideo = true;
-      }
-    }
+    // Build the request payload (exactly like BraveDown's frontend)
+    const payload = {
+      _token: token,
+      components: [{
+        snapshot: JSON.stringify({
+          data: {
+            zlinkz: null,
+            render_mode: false,
+            stream_vid: false,
+            stream_thumb: true,
+            data: null,
+            status: null,
+            message: null
+          },
+          memo: {
+            id: wireId,
+            name: 'public.tool.downloader-public',
+            path: 'facebook-story-downloader',
+            method: 'GET',
+            release: 'a-a-a',
+            children: [],
+            scripts: ['25050802-0'],
+            assets: [],
+            errors: [],
+            locale: 'en'
+          },
+          checksum: '52e57ef209d2075abcb8a18e9a984fac4757978ea97010a346dcdaf5818e95d5'
+        }),
+        updates: {
+          zlinkz: storyLink
+        },
+        calls: [{
+          path: '',
+          method: 'onDownload',
+          params: []
+        }]
+      }]
+    };
 
-    // Method 4: Look for video download link
-    if (!mediaUrl) {
-      const downloadMatch = html.match(/"download_url":"([^"]+)"/i)
-        || html.match(/<a[^>]*href="([^"]*fbcdn[^"]*\.(mp4)[^"]*)"[^>]*download/i);
-      if (downloadMatch) {
-        mediaUrl = downloadMatch[1].replace(/\\\//g, '/').replace(/&amp;/g, '&');
-        isVideo = true;
-      }
-    }
+    // Call BraveDown's Livewire API
+    const bravedownResp = await axios.post(BRAVEDOWN_API, payload, {
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-Livewire': 'true',
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36',
+        'Referer': 'https://bravedown.com/facebook-story-downloader',
+        'Cookie': sessionCookie
+      },
+      timeout: 20000
+    });
 
-    // Method 5: Facebook's blob/attachment URLs
-    if (!mediaUrl) {
-      const blobMatch = html.match(/"playable_url":"([^"]+)"/i)
-        || html.match(/"playable_url_quality_hd":"([^"]+)"/i)
-        || html.match(/"browser_native_video_url":"([^"]+)"/i);
-      if (blobMatch) {
-        mediaUrl = blobMatch[1].replace(/\\\//g, '/').replace(/&amp;/g, '&');
-        isVideo = true;
-      }
-    }
+    // Parse the response to get the download URL
+    const respData = bravedownResp.data;
+    let downloadUrl = null;
 
-    // Method 6: Find any video in the page (last resort)
-    if (!mediaUrl) {
-      const anyVideo = html.match(/<source\s+src="([^"]+\.mp4[^"]*)"/i)
-        || html.match(/<video[^>]+src="([^"]+\.mp4[^"]*)"/i);
-      if (anyVideo) {
-        mediaUrl = anyVideo[1].replace(/&amp;/g, '&');
-        isVideo = true;
-      }
-    }
-
-    // Method 7: Find large images only (stories are usually > 200px)
-    if (!mediaUrl) {
-      const allImages = html.match(/<img[^>]+src="([^"]+)"/gi);
-      if (allImages) {
-        for (const imgTag of allImages) {
-          const srcMatch = imgTag.match(/src="([^"]+)"/);
-          if (srcMatch) {
-            const src = srcMatch[1].replace(/&amp;/g, '&');
-            // Filter out small icons, profile pics, etc.
-            if (src.includes('fbcdn') && 
-                !src.includes('profile') && 
-                !src.includes('icon') && 
-                !src.includes('emoji') &&
-                !src.includes('thumb') &&
-                !src.includes('avatar') &&
-                (src.includes('story') || src.includes('stories') || src.match(/\/\d+x\d+\//))) {
-              mediaUrl = src;
-              break;
-            }
-          }
+    // Extract the download URL from the nested JSON response
+    try {
+      const snapshot = JSON.parse(respData.components[0].snapshot);
+      if (snapshot.data && snapshot.data.data && snapshot.data.data[0]) {
+        const storyData = snapshot.data.data[0];
+        if (storyData.links && storyData.links[0] && storyData.links[0][0]) {
+          downloadUrl = storyData.links[0][0][0][0].url;
         }
       }
+    } catch (e) {
+      // Try regex fallback
+      const urlMatch = JSON.stringify(respData).match(/https:\\\/\\\/acdn\.bravedown\.com\\\/download\?token=[^"\\]+/);
+      if (urlMatch) {
+        downloadUrl = urlMatch[0].replace(/\\\//g, '/');
+      }
     }
 
-    if (!mediaUrl) {
-      return res.status(400).json({ 
-        error: 'Could not find story media. The story may be private or expired. Try a public story.' 
-      });
+    if (!downloadUrl) {
+      return res.status(400).json({ error: 'Could not extract download URL from BraveDown' });
     }
 
-    // Fix URL if it starts with //
-    if (mediaUrl.startsWith('//')) {
-      mediaUrl = 'https:' + mediaUrl;
-    }
-
-    console.log('Found media URL:', mediaUrl);
-
-    // Download the actual media
-    const mediaResp = await axios.get(mediaUrl, {
+    // Download the media file from BraveDown's CDN
+    const mediaResp = await axios.get(downloadUrl, {
       responseType: 'arraybuffer',
       timeout: 30000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-        'Referer': 'https://www.facebook.com/'
-      }
+      headers: { 'User-Agent': 'Mozilla/5.0' }
     });
 
-    const contentType = mediaResp.headers['content-type'] || (isVideo ? 'video/mp4' : 'image/jpeg');
-    const ext = isVideo ? 'mp4' : (contentType.includes('png') ? 'png' : 'jpg');
+    const contentType = mediaResp.headers['content-type'] || 'image/jpeg';
+    const isVideo = contentType.startsWith('video');
+    const ext = isVideo ? 'mp4' : 'jpg';
 
     // Upload to Supabase
-    const supabase = createClient(
-      process.env.SUPABASE_URL,
-      process.env.SUPABASE_SERVICE_ROLE_KEY
-    );
-    
+    const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
     const fileName = `stories/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
     
     const { error: uploadError } = await supabase.storage
@@ -163,6 +148,9 @@ export default async function handler(req, res) {
 
   } catch (err) {
     console.error('Error:', err.message);
-    return res.status(500).json({ error: 'Download failed', message: err.message });
+    return res.status(500).json({ 
+      error: 'Download failed', 
+      message: err.response?.status || err.message 
+    });
   }
 }
